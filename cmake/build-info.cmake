@@ -46,3 +46,6 @@ if(CMAKE_VS_PLATFORM_NAME)
 else()
     set(BUILD_TARGET "${CMAKE_SYSTEM_NAME} ${CMAKE_SYSTEM_PROCESSOR}")
 endif()
+
+# Mix build: report the upstream base build, not this tree's commit count.
+set(BUILD_NUMBER 11160)
