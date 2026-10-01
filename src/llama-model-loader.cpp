@@ -1116,6 +1116,75 @@ bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_ten
     return true;
 }
 
+// declared in llama-model.h, which this file does not include
+const std::vector<std::pair<std::string, ggml_tensor *>> & llama_internal_get_tensor_map(const llama_model * model);
+
+struct ggml_tensor * llama_model_loader::borrow_shared_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne,
+        bool * borrows_without_target) {
+    // checked first so no other tensor in any model pays a metadata lookup
+    if (tn.tensor != LLM_TENSOR_TOKEN_EMBD && tn.tensor != LLM_TENSOR_OUTPUT && tn.tensor != LLM_TENSOR_OUTPUT_NORM) {
+        return nullptr;
+    }
+
+    if (shared_target_tensors < 0) {
+        bool shared = false;
+        get_key(LLM_KV_NEXTN_SHARED_TARGET_TENSORS, shared, false);
+        shared_target_tensors = shared ? 1 : 0;
+    }
+    if (shared_target_tensors == 0) {
+        return nullptr;
+    }
+
+    const std::string name = tn.str();
+    if (get_weight(name.c_str()) != nullptr) {
+        return nullptr;
+    }
+
+    if (model_shared == nullptr) {
+        // the fit opens the draft alone to price it; throwing there only makes it budget
+        // nothing for the draft, so report the borrow and let the caller stand a shape in
+        if (no_alloc && borrows_without_target != nullptr) {
+            *borrows_without_target = true;
+            return nullptr;
+        }
+        throw std::runtime_error(format("%s: this model is a draft head without its own '%s'; "
+                    "load it as a draft of its target model, not on its own", __func__, name.c_str()));
+    }
+
+    ggml_tensor * src = nullptr;
+    for (const auto & [n, t] : llama_internal_get_tensor_map(model_shared)) {
+        if (n == name) {
+            src = t;
+            break;
+        }
+    }
+    if (src == nullptr) {
+        throw std::runtime_error(format("%s: draft needs tensor '%s' from the target, which does not have it",
+                    __func__, name.c_str()));
+    }
+
+    // used directly, so the shapes must agree exactly
+    size_t dim = 0;
+    for (const int64_t n : ne) {
+        if (dim >= GGML_MAX_DIMS || src->ne[dim] != n) {
+            throw std::runtime_error(format("%s: draft and target disagree on '%s': target has %s, draft wants %s",
+                        __func__, name.c_str(), llama_format_tensor_shape(src).c_str(), llama_format_tensor_shape(ne).c_str()));
+        }
+        dim++;
+    }
+    for (; dim < GGML_MAX_DIMS; dim++) {
+        if (src->ne[dim] != 1) {
+            throw std::runtime_error(format("%s: draft and target disagree on '%s': target has %s, draft wants %s",
+                        __func__, name.c_str(), llama_format_tensor_shape(src).c_str(), llama_format_tensor_shape(ne).c_str()));
+        }
+    }
+
+    LLAMA_LOG_INFO("%s: tensor %s taken from the target model\n", __func__, name.c_str());
+
+    // not counted in n_created/size_data: not in this file, neither allocated nor freed here
+    return src;
+}
+
 struct ggml_tensor * llama_model_loader::create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
@@ -1332,6 +1401,39 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         GGML_ASSERT(buft != nullptr);
         ggml_context * ctx = ctx_for_buft(buft);
         ggml_tensor * ret = ggml_dup_tensor(ctx, &t_meta);
+        ggml_set_name(ret, tn.str().c_str());
+        return ret;
+    }
+
+    // must precede check_tensor_dims, and must win over the arch fallback that ties output to token_embd
+    bool borrows_without_target = false;
+    if (ggml_tensor * shared = borrow_shared_tensor(tn, ne, &borrows_without_target)) {
+        return shared;
+    }
+    if (borrows_without_target) {
+        // shape only, on CPU: the graph needs the dimensions, but the bytes are the
+        // target's and are counted in its own measurement
+        ggml_type type = GGML_TYPE_F32;
+        const int64_t tid_shared = gguf_find_tensor(metadata, tn.str().c_str());
+        if (tid_shared != -1) {
+            type = gguf_get_tensor_type(metadata, tid_shared);
+        }
+        ggml_tensor t_shared;
+        memset(&t_shared, 0, sizeof(ggml_tensor));
+        t_shared.type = type;
+        for (size_t dim = 0; dim < GGML_MAX_DIMS; dim++) {
+            t_shared.ne[dim] = dim < ne.size() ? ne.begin()[dim] : 1;
+            GGML_ASSERT(t_shared.ne[dim] >= 1);
+            if (dim == 0) {
+                t_shared.nb[dim] = ggml_type_size(type);
+            } else if (dim == 1) {
+                t_shared.nb[dim] = ggml_row_size(type, t_shared.ne[dim-1]);
+            } else {
+                t_shared.nb[dim] = t_shared.nb[dim-1]*t_shared.ne[dim-1];
+            }
+        }
+        ggml_set_name(&t_shared, tn.str().c_str());
+        ggml_tensor * ret = ggml_dup_tensor(ctx_for_buft(ggml_backend_cpu_buffer_type()), &t_shared);
         ggml_set_name(ret, tn.str().c_str());
         return ret;
     }
